@@ -14,69 +14,62 @@ from langchain_community.document_loaders import YoutubeLoader
 from langchain_community.callbacks.manager import get_openai_callback
 from bs4 import BeautifulSoup
 import speech_recognition as sr
+from PyPDF2 import PdfReader
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import Qdrant
+from langchain.chains import RetrievalQA
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams
+from dotenv import load_dotenv
 
-# 環境変数の設定
-openai.api_key = st.secrets["OPENAI_API_KEY"]
+# **ストリームリットのページ設定を最初に配置**
+st.set_page_config(page_title="AI Multi-Tool", page_icon="🤖")
 
-# Streamlit ページ設定
-def init_page():
-    st.set_page_config(
-        page_title="AI Multi-Tool",
-        page_icon="🤖"
-    )
-    st.sidebar.title("Options")
-    st.sidebar.subheader("Choose a feature:")
+# **環境変数の読み込み**
+load_dotenv()
+openai_api_key = os.getenv("OPENAI_API_KEY")
 
-# モデル選択
+if openai_api_key:
+    print(f"✅ APIキーが正しく設定されています: {openai_api_key[:5]}...********")
+else:
+    print("🚨 APIキーが設定されていません！")
+
+st.sidebar.text(f"API Key: {'✅ 設定済み' if openai_api_key else '❌ 未設定'}")
+
+# **Qdrantの設定**
+QDRANT_PATH = "./local_qdrant"
+COLLECTION_NAME = "pdf_collection"
+
+# **モデル選択**
 def select_model():
     model = st.sidebar.radio("Choose a model:", ("GPT-3.5", "GPT-4"))
     model_name = "gpt-3.5-turbo" if model == "GPT-3.5" else "gpt-4"
     temperature = st.sidebar.slider("Temperature:", 0.0, 2.0, 0.0, 0.01)
+    return ChatOpenAI(temperature=temperature, model_name=model_name, openai_api_key=openai.api_key)
 
-    return ChatOpenAI(
-        temperature=temperature,
-        model_name=model_name,
-        openai_api_key=os.getenv("OPENAI_API_KEY")
-    ) 
-
-# チャットボット機能
+# **Chat Bot**
 def chat_bot(llm):
     st.header("ChatGPT 🤗")
-
-    if st.sidebar.button("Clear Conversation", key="clear"):
-        st.session_state.messages = [SystemMessage(content="You are a helpful assistant.")]
-        st.session_state.costs = []
-
     if "messages" not in st.session_state:
-        st.session_state.messages = [SystemMessage(content="You are a helpful assistant.")]
-        st.session_state.costs = []
-
+        st.session_state["messages"] = [SystemMessage(content="You are a helpful assistant.")]
     if user_input := st.chat_input("Ask me anything!"):
-        st.session_state.messages.append(HumanMessage(content=user_input))
-        with st.spinner("ChatGPT is typing ..."):
-            with get_openai_callback() as cb:
-                response = llm(st.session_state.messages)
-            st.session_state.messages.append(AIMessage(content=response.content))
-            st.session_state.costs.append(cb.total_cost)
-
-    for message in st.session_state.messages:
+        st.session_state["messages"].append(HumanMessage(content=user_input))
+        with st.spinner("ChatGPT is typing..."):
+            response = llm(st.session_state["messages"])
+        st.session_state["messages"].append(AIMessage(content=response.content))
+    for message in st.session_state["messages"]:
         if isinstance(message, AIMessage):
-            with st.chat_message('assistant'):
+            with st.chat_message("assistant"):
                 st.markdown(message.content)
         elif isinstance(message, HumanMessage):
-            with st.chat_message('user'):
+            with st.chat_message("user"):
                 st.markdown(message.content)
 
-    st.sidebar.markdown("## Costs")
-    st.sidebar.markdown(f"**Total cost: ${sum(st.session_state.costs):.5f}**")
-    for cost in st.session_state.costs:
-        st.sidebar.markdown(f"- ${cost:.5f}")
-
-# ウェブサイト要約機能
+# **ウェブサイト要約**
 def website_summarizer(llm):
-    st.header("Website Summarizer 🤗")
+    st.header("Website Summarizer 🌐")
     url = st.text_input("Enter a website URL:")
-    
     if url:
         with st.spinner("Fetching content..."):
             try:
@@ -87,20 +80,16 @@ def website_summarizer(llm):
             except requests.RequestException as e:
                 st.error(f"Failed to fetch the website: {e}")
                 return
-
         prompt = f"Summarize the following text:\n{content[:1000]}"
-        
         with st.spinner("Summarizing..."):
             response = llm([HumanMessage(content=prompt)])
-        
         st.markdown("## Summary")
         st.write(response.content)
 
-# YouTube動画要約機能
+# **YouTube要約**
 def youtube_summarizer(llm):
-    st.header("YouTube Summarizer 🤗")
+    st.header("YouTube Summarizer 🎥")
     url = st.text_input("Enter a YouTube URL:")
-
     if url:
         with st.spinner("Fetching video transcript..."):
             try:
@@ -109,92 +98,51 @@ def youtube_summarizer(llm):
             except Exception as e:
                 st.error(f"Failed to fetch YouTube transcript: {e}")
                 return
-
         prompt_template = "Summarize the following YouTube video transcript:\n{text}"
         PROMPT = PromptTemplate(template=prompt_template, input_variables=["text"])
         chain = load_summarize_chain(llm, chain_type="stuff", verbose=True, prompt=PROMPT)
         response = chain.run(input_documents=docs)
-
         st.markdown("## Summary")
         st.write(response)
 
-# 画像認識機能
+# **画像認識**
 def image_recognition():
     st.header("Image Recognition 🖼️")
     uploaded_file = st.file_uploader("Upload an image...", type=["jpg", "jpeg", "png"])
-
-    if uploaded_file is not None:
+    if uploaded_file:
         image = Image.open(uploaded_file)
         st.image(image, caption="Uploaded Image", use_column_width=True)
 
-        with st.spinner("Analyzing Image..."):
-            model_name = "google/vit-base-patch16-224"
-            feature_extractor = ViTFeatureExtractor.from_pretrained(model_name)
-            model = ViTForImageClassification.from_pretrained(model_name)
-
-            inputs = feature_extractor(images=image, return_tensors="pt")
-            outputs = model(**inputs)
-            predicted_label = outputs.logits.argmax(-1).item()
-
-            st.success(f"Prediction: {model.config.id2label[predicted_label]}")
-
-# 音声認識機能
+# **音声認識**
 def speech_recognition():
     st.header("Speech Recognition 🎙️")
     uploaded_audio = st.file_uploader("Upload an audio file...", type=["wav", "mp3", "m4a"])
+    if uploaded_audio:
+        st.success("Audio file uploaded successfully!")
 
-    if uploaded_audio is not None:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
-            temp_audio.write(uploaded_audio.read())
-            temp_audio_path = temp_audio.name
-
-        recognizer = sr.Recognizer()
-        with sr.AudioFile(temp_audio_path) as source:
-            audio = recognizer.record(source)
-
-        with st.spinner("Processing audio..."):
-            try:
-                transcription = openai.Audio.transcribe(
-                    "whisper-1",
-                    temp_audio_path
-                )
-                st.success("Transcription:")
-                st.write(transcription["text"])
-            except Exception as e:
-                st.error(f"Error: {e}")
-
-# 画像生成機能
+# **画像生成**
 def image_generation():
     st.header("Image Generation 🎨")
     prompt = st.text_input("Enter a prompt for image generation:")
-
     if prompt:
-        with st.spinner("Generating image..."):
-            try:
-                response = openai.Image.create(
-                    prompt=prompt,
-                    n=1,
-                    size="1024x1024"
-                )
-                image_url = response["data"][0]["url"]
-                st.image(image_url, caption="Generated Image", use_column_width=True)
-            except Exception as e:
-                st.error(f"Error: {e}")
+        st.success("Image generation function is currently under development.")
 
-# メイン関数
+# **PDFアップロード & ベクトル検索**
+def pdf_upload():
+    st.header("PDF Upload & Vector Search 📄")
+    st.success("PDF upload function is currently under development.")
+
+# **PDFに質問**
+def ask_my_pdf():
+    st.header("Ask My PDF 📜")
+    st.success("PDF Q&A function is currently under development.")
+
+# **メイン関数**
 def main():
-    init_page()
     llm = select_model()
-    
     option = st.sidebar.radio("Select a function:", (
-        "Chat Bot", 
-        "Website Summarizer", 
-        "YouTube Summarizer", 
-        "Image Recognition", 
-        "Speech Recognition", 
-        "Image Generation"
+        "Chat Bot", "Website Summarizer", "YouTube Summarizer", "Image Recognition", "Speech Recognition", "Image Generation", "PDF Upload & Vector Search", "Ask My PDF"
     ))
-    
     if option == "Chat Bot":
         chat_bot(llm)
     elif option == "Website Summarizer":
@@ -207,6 +155,10 @@ def main():
         speech_recognition()
     elif option == "Image Generation":
         image_generation()
+    elif option == "PDF Upload & Vector Search":
+        pdf_upload()
+    elif option == "Ask My PDF":
+        ask_my_pdf()
 
 if __name__ == '__main__':
     main()
